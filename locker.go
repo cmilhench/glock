@@ -2,6 +2,7 @@ package glock
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -49,4 +50,61 @@ func WaitAcquire(ctx context.Context, locker Locker, opts Options) (bool, error)
 			}
 		}
 	}
+}
+
+func WithLock(ctx context.Context, locker Locker, renewInterval time.Duration, work func(context.Context) error) error {
+	// Assume lock acquire already?
+	// acquired, err := locker.Acquire(ctx)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to acquire lock: %w", err)
+	// }
+	// if !acquired {
+	// 	return fmt.Errorf("could not acquire lock")
+	// }
+
+	defer func() {
+		_, _ = locker.Release(ctx)
+	}()
+
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errChan := make(chan error, 1)
+
+	go func() {
+		ticker := time.NewTicker(renewInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-workCtx.Done():
+				return
+			case <-ticker.C:
+				renewed, err := locker.Renew(ctx)
+				if err != nil {
+					errChan <- fmt.Errorf("failed to renew lock: %w", err)
+					cancel()
+					return
+				}
+				if !renewed {
+					errChan <- fmt.Errorf("lock renewal failed")
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	go func() {
+		if err := work(workCtx); err != nil {
+			errChan <- fmt.Errorf("work failed: %w", err)
+		}
+		close(errChan)
+	}()
+
+	if err := <-errChan; err != nil {
+		return err
+	}
+
+	return nil
 }
